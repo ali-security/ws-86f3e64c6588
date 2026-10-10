@@ -92,7 +92,9 @@ describe('WebSocket', () => {
         assert.strictEqual(count, 2);
       });
 
-      it('accepts the `maxPayload` option', (done) => {
+      it('accepts the receiver limit options', (done) => {
+        const maxBufferedChunks = 1024;
+        const maxFragments = 512;
         const maxPayload = 20480;
         const wss = new WebSocket.Server(
           {
@@ -102,10 +104,17 @@ describe('WebSocket', () => {
           () => {
             const ws = new WebSocket(`ws://localhost:${wss.address().port}`, {
               perMessageDeflate: true,
+              maxBufferedChunks,
+              maxFragments,
               maxPayload
             });
 
             ws.on('open', () => {
+              assert.strictEqual(
+                ws._receiver._maxBufferedChunks,
+                maxBufferedChunks
+              );
+              assert.strictEqual(ws._receiver._maxFragments, maxFragments);
               assert.strictEqual(ws._receiver._maxPayload, maxPayload);
               assert.strictEqual(
                 ws._receiver._extensions['permessage-deflate']._maxPayload,
@@ -585,6 +594,100 @@ describe('WebSocket', () => {
         });
 
         ws._socket.write(Buffer.from([0x85, 0x00]));
+      });
+    });
+
+    it("emits an 'error' event if a message has too many fragments (1/2)", (done) => {
+      let clientCloseEventEmitted = false;
+      let serverClientCloseEventEmitted = false;
+
+      const wss = new WebSocket.Server({ port: 0 }, () => {
+        const ws = new WebSocket(`ws://localhost:${wss.address().port}`);
+
+        ws.on('error', (err) => {
+          assert.ok(err instanceof RangeError);
+          assert.strictEqual(err.code, 'WS_ERR_TOO_MANY_BUFFERED_PARTS');
+          assert.strictEqual(err.message, 'Too many message fragments');
+          assert.strictEqual(ws._receiver._maxBufferedChunks, 256 * 1024);
+          assert.strictEqual(ws._receiver._maxFragments, 16 * 1024);
+
+          ws.on('close', (code, reason) => {
+            assert.strictEqual(code, 1006);
+            assert.strictEqual(reason, EMPTY_BUFFER);
+
+            clientCloseEventEmitted = true;
+            if (serverClientCloseEventEmitted) wss.close(done);
+          });
+        });
+      });
+
+      wss.on('connection', (ws) => {
+        ws.on('close', (code, reason) => {
+          assert.strictEqual(code, 1008);
+          assert.deepStrictEqual(reason, EMPTY_BUFFER);
+
+          serverClientCloseEventEmitted = true;
+          if (clientCloseEventEmitted) wss.close(done);
+        });
+
+        //
+        // A non-final binary frame followed by empty continuation frames,
+        // one more than the default client limit.
+        //
+        const list = [Buffer.from([0x02, 0x00])];
+
+        for (let i = 0; i < 16 * 1024; i++) {
+          list.push(Buffer.from([0x00, 0x00]));
+        }
+
+        ws._socket.write(Buffer.concat(list));
+      });
+    });
+
+    it("emits an 'error' event if a message has too many fragments (2/2)", (done) => {
+      let clientCloseEventEmitted = false;
+      let serverClientCloseEventEmitted = false;
+
+      const wss = new WebSocket.Server({ port: 0 }, () => {
+        const ws = new WebSocket(`ws://localhost:${wss.address().port}`);
+
+        ws.on('close', (code, reason) => {
+          assert.strictEqual(code, 1008);
+          assert.deepStrictEqual(reason, EMPTY_BUFFER);
+
+          clientCloseEventEmitted = true;
+          if (serverClientCloseEventEmitted) wss.close(done);
+        });
+      });
+
+      wss.on('connection', (ws) => {
+        ws.on('error', (err) => {
+          assert.ok(err instanceof RangeError);
+          assert.strictEqual(err.code, 'WS_ERR_TOO_MANY_BUFFERED_PARTS');
+          assert.strictEqual(err.message, 'Too many message fragments');
+          assert.strictEqual(ws._receiver._maxBufferedChunks, 256 * 1024);
+          assert.strictEqual(ws._receiver._maxFragments, 16 * 1024);
+
+          ws.on('close', (code, reason) => {
+            assert.strictEqual(code, 1006);
+            assert.strictEqual(reason, EMPTY_BUFFER);
+
+            serverClientCloseEventEmitted = true;
+            if (clientCloseEventEmitted) wss.close(done);
+          });
+        });
+
+        //
+        // A masked non-final binary frame followed by masked empty
+        // continuation frames, one more than the default server limit.
+        //
+        const list = [Buffer.from([0x02, 0x80, 0x00, 0x00, 0x00, 0x00])];
+
+        for (let i = 0; i < 16 * 1024; i++) {
+          list.push(Buffer.from([0x00, 0x80, 0x00, 0x00, 0x00, 0x00]));
+        }
+
+        ws._socket.push(Buffer.concat(list));
       });
     });
 
